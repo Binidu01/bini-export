@@ -1,0 +1,66 @@
+{
+  "name": "bini-export",
+  "version": "1.0.1",
+  "description": "Pure static SPA export for bini-router — pre-renders routes, generates 404.html, strips platform files",
+  "type": "module",
+  "license": "MIT",
+  "author": "Binidu Ranasinghe",
+  "keywords": [
+    "vite",
+    "vite-plugin",
+    "bini",
+    "bini-js",
+    "bini-router",
+    "static",
+    "export",
+    "spa",
+    "prerender",
+    "static-site",
+    "github-pages",
+    "netlify",
+    "vercel",
+    "cloudflare",
+    "404"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build",
+    "clean": "rm -rf dist"
+  },
+  "peerDependencies": {
+    "vite": ">=7.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Binidu01/bini-export.git"
+  },
+  "homepage": "https://bini.js.org",
+  "bugs": {
+    "url": "https://github.com/Binidu01/bini-export/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
