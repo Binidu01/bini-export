@@ -1,7 +1,7 @@
 {
   "name": "bini-export",
-  "version": "1.0.1",
-  "description": "Pure static SPA export for bini-router — pre-renders routes, generates 404.html, strips platform files",
+  "version": "1.0.2",
+  "description": "Static SPA export for bini-router — pre-renders routes, generates 404.html, and strips platform files for GitHub Pages and other fully static hosts",
   "type": "module",
   "license": "MIT",
   "author": "Binidu Ranasinghe",
@@ -61,6 +61,6 @@
     "url": "https://github.com/Binidu01/bini-export/issues"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.19.0"
   }
 }
