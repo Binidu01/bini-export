@@ -1,7 +1,7 @@
 {
   "name": "bini-export",
-  "version": "1.0.2",
-  "description": "Static SPA export for bini-router — pre-renders routes, generates 404.html, and strips platform files for GitHub Pages and other fully static hosts",
+  "version": "1.0.3",
+  "description": "Static export for Bini.js with true SSG — pre-renders routes to static HTML with full page content via headless browser",
   "type": "module",
   "license": "MIT",
   "author": "Binidu Ranasinghe",
@@ -13,14 +13,17 @@
     "bini-router",
     "static",
     "export",
-    "spa",
+    "ssg",
     "prerender",
     "static-site",
     "github-pages",
     "netlify",
     "vercel",
     "cloudflare",
-    "404"
+    "404",
+    "react",
+    "react-router",
+    "puppeteer"
   ],
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -28,13 +31,20 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     }
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsup",
@@ -43,14 +53,17 @@
     "prepublishOnly": "npm run build",
     "clean": "rm -rf dist"
   },
+  "dependencies": {
+    "puppeteer": "^25.4.0"
+  },
   "peerDependencies": {
-    "vite": ">=7.0.0 || ^8.0.0"
+    "vite": ">=5.0.0 || ^6.0.0 || ^7.0.0 || ^8.0.0"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
+    "@types/node": "^22.20.1",
     "tsup": "^8.3.5",
     "typescript": "^5.9.3",
-    "vite": "^8.0.0"
+    "vite": "^8.2.0"
   },
   "repository": {
     "type": "git",
@@ -61,6 +74,6 @@
     "url": "https://github.com/Binidu01/bini-export/issues"
   },
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=20.0.0"
   }
 }

@@ -1,405 +1,434 @@
 // bini-export/src/index.ts
-// Static SPA export for GitHub Pages.
-//
-// WHAT IT DOES (and nothing more)
-// ──────────────────────────────────────────────────────────────────────────────
-// 1. Patches BrowserRouter basename in the generated App.tsx to match
-//    Vite's `base` config before the build runs, then restores it after.
-//    (bini-router always writes basename="/" — this is the root cause of
-//    the blank page on GitHub Pages when base is set to a repo sub-path)
-//
-// 2. Copies dist/index.html into dist/<route>/index.html for every static
-//    route found in the generated App.tsx, so GitHub Pages serves them
-//    directly without needing a redirect round-trip.
-//
-// 3. Writes a dist/404.html that saves the full original URL to
-//    sessionStorage and redirects to the repo root. The receiver script
-//    (injected into index.html) restores the full URL before React boots
-//    so BrowserRouter can strip the basename and match the correct route.
-//    NOTE: the full URL including the basename prefix must be stored and
-//    restored — restoring only the path suffix breaks BrowserRouter.
-//
-// 4. Removes any platform entry files bini-router generated (server/,
-//    worker.ts, netlify/, etc.) that have no place in a static export.
-//
-// SETUP
-// ──────────────────────────────────────────────────────────────────────────────
-//   vite.config.ts
-//     base: '/your-repo-name/'
-//     plugins: [react(), biniroute({ platform: 'node' }), biniExport()]
-//
-//   package.json
-//     "export": "vite build --mode export"
-//
-// USAGE
-//   pnpm export  →  builds dist/ ready to push to GitHub Pages
-
-import fs   from 'node:fs'
-import path from 'node:path'
-import type { Plugin, ResolvedConfig } from 'vite'
-
-// ─── Types ───────────────────────────────────────────────────────────────────
+import fs from 'node:fs';
+import path from 'node:path';
+import type { Plugin, ResolvedConfig } from 'vite';
+import { createServer } from 'vite';
 
 export interface BiniExportOptions {
-  /** Extra paths to delete after build, relative to project root. @default [] */
-  cleanPaths?: string[]
   /** Vite mode that activates this plugin. @default 'export' */
-  mode?: string
+  mode?: string;
   /** Write dist/404.html. @default true */
-  copy404?: boolean
-  /** Copy index.html into each route folder. @default true */
-  prerender?: boolean
+  copy404?: boolean;
+  /** Enable true SSG via headless-browser prerendering. @default true */
+  ssg?: boolean;
+  /** Routes to pre-render (auto-detected if not specified) */
+  routes?: string[];
+  /**
+   * Selector that must exist in the DOM (and, if possible, be non-empty)
+   * before the page is considered "rendered". @default '#root'
+   */
+  waitForSelector?: string;
+  /** Max time (ms) to wait for a route to finish rendering. @default 15000 */
+  renderTimeoutMs?: number;
+  /** Custom Puppeteer launch options */
+  puppeteerOptions?: {
+    headless?: boolean;
+    args?: string[];
+    executablePath?: string;
+    timeout?: number;
+  };
 }
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+export function biniExport(opts: BiniExportOptions = {}): Plugin {
+  const {
+    mode: targetMode = 'export',
+    copy404 = true,
+    ssg = true,
+    routes: userRoutes,
+    waitForSelector = '#root',
+    renderTimeoutMs = 15000,
+    puppeteerOptions = {},
+  } = opts;
 
-const BINI_ROUTER_GENERATED = [
-  'netlify/edge-functions/api.ts',
-  'netlify/edge-functions/api.js',
-  'worker.ts',
-  'worker.js',
-  'server/index.ts',
-  'server/index.js',
-  'handler.ts',
-  'handler.js',
-  'api/index.ts',
-  'api/index.js',
-]
+  const C = {
+    cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
+    green: (s: string) => `\x1b[32m${s}\x1b[0m`,
+    yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
+    dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
+    red: (s: string) => `\x1b[31m${s}\x1b[0m`,
+  };
 
-const APP_CANDIDATES    = ['src/App.tsx', 'src/App.jsx'] as const
-const NOT_FOUND_EXTS    = ['.tsx', '.jsx', '.ts', '.js'] as const
+  let cfg!: ResolvedConfig;
+  let isExport = false;
+  let originalTemplate: string = '';
 
-const C = {
-  cyan  : (s: string) => `\x1b[36m${s}\x1b[0m`,
-  green : (s: string) => `\x1b[32m${s}\x1b[0m`,
-  yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
-  dim   : (s: string) => `\x1b[2m${s}\x1b[0m`,
-}
+  // ─── Helpers ────────────────────────────────────────────────────────────
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/** '/repo/'  → '/repo'   |   '/' → '' */
-function normBase(base: string): string {
-  const b = base.startsWith('/') ? base : `/${base}`
-  return b === '/' ? '' : b.replace(/\/$/, '')
-}
-
-function findAppFile(root: string): string | null {
-  for (const r of APP_CANDIDATES) {
-    const abs = path.join(root, r)
-    if (fs.existsSync(abs)) return abs
+  function normBase(base: string): string {
+    const b = base.startsWith('/') ? base : `/${base}`;
+    return b === '/' ? '' : b.replace(/\/$/, '');
   }
-  return null
-}
 
-function findNotFoundFile(root: string): boolean {
-  for (const ext of NOT_FOUND_EXTS) {
-    if (fs.existsSync(path.join(root, `src/app/not-found${ext}`))) return true
+  // ─── Route Collector for src/app/ ──────────────────────────────────────
+
+  async function collectAllRoutes(root: string): Promise<string[]> {
+    if (userRoutes) return userRoutes;
+
+    const routes = new Set<string>(['/']);
+    const appDir = path.join(root, 'src/app');
+
+    if (!fs.existsSync(appDir)) {
+      return ['/'];
+    }
+
+    await collectRoutesFromDir(appDir, '', routes);
+    
+    const filtered = [...routes].filter(r => {
+      const parts = r.split('/').filter(Boolean);
+      if (parts.length === 0) return true;
+      const lastPart = parts[parts.length - 1];
+      return !['layout', 'loading', 'error', 'not-found', 'api', '_components', '_lib', '_hooks'].includes(lastPart) &&
+             !lastPart.startsWith('_') &&
+             !r.includes(':') &&
+             !r.includes('*');
+    });
+    
+    return filtered.map(r => r.startsWith('/') ? r : `/${r}`);
   }
-  return false
-}
 
-/**
- * Replace basename={"/"} in the bini-router generated App file.
- * Returns the original content so the caller can restore it, or null
- * if the pattern was not found or the value was already correct.
- */
-function patchBasename(appFile: string, base: string): string | null {
-  let original: string
-  try { original = fs.readFileSync(appFile, 'utf8') } catch { return null }
+  async function collectRoutesFromDir(
+    dir: string,
+    basePath: string,
+    routes: Set<string>
+  ): Promise<void> {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
 
-  const re = /basename=\{("[^"]*")\}/
-  if (!re.test(original)) return null
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
 
-  const patched = original.replace(re, `basename={${JSON.stringify(base)}}`)
-  if (patched === original) return null          // already the right value
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith('(') && entry.name.endsWith(')')) {
+          await collectRoutesFromDir(fullPath, basePath, routes);
+          continue;
+        }
+        if (entry.name === 'api') continue;
+        if (entry.name.startsWith('_')) continue;
+        if (entry.name.startsWith('[') && entry.name.endsWith(']')) {
+          continue;
+        }
 
-  try { fs.writeFileSync(appFile, patched, 'utf8') } catch { return null }
-  return original
-}
-
-/**
- * Read static route paths from the generated App.tsx.
- * Skips dynamic (:param) and catch-all (*) routes.
- */
-function scanRoutes(root: string): string[] {
-  let src = ''
-  for (const r of APP_CANDIDATES) {
-    const f = path.join(root, r)
-    if (fs.existsSync(f)) { src = fs.readFileSync(f, 'utf8'); break }
+        const newPath = basePath ? `${basePath}/${entry.name}` : `/${entry.name}`;
+        await collectRoutesFromDir(fullPath, newPath, routes);
+      } else if (entry.name === 'page.jsx' || entry.name === 'page.tsx') {
+        const routePath = basePath || '/';
+        routes.add(routePath);
+      } else if (entry.name.endsWith('.mdx') || entry.name.endsWith('.md')) {
+        const name = entry.name.replace(/\.(mdx|md)$/, '');
+        if (name !== 'page') {
+          const routePath = basePath ? `${basePath}/${name}` : `/${name}`;
+          routes.add(routePath);
+        }
+      } else if (entry.name.endsWith('.tsx') || entry.name.endsWith('.jsx')) {
+        const name = entry.name.replace(/\.(tsx|jsx)$/, '');
+        if (name !== 'page' && name !== 'layout' && name !== 'loading' && 
+            name !== 'error' && name !== 'not-found') {
+          const routePath = basePath ? `${basePath}/${name}` : `/${name}`;
+          routes.add(routePath);
+        }
+      }
+    }
   }
-  if (!src) return ['/']
 
-  const routes = new Set<string>(['/'])
-  const re     = /\bpath=["']([^"']+)["']/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(src)) !== null) {
-    const p = m[1]?.trim()
-    if (!p || p === '/' || p === '*') continue
-    if (p.includes(':') || p.includes('*')) continue
-    routes.add(p.startsWith('/') ? p : `/${p}`)
+  // ─── Direct Puppeteer Prerenderer ──────────────────────────────────────
+
+  async function prerenderWithPuppeteer(
+    routes: string[],
+    outDir: string,
+    template: string
+  ): Promise<{ rendered: number; failed: number; errors: string[] }> {
+    let puppeteer: any;
+    let server: any;
+    let port: number;
+
+    try {
+      puppeteer = await import('puppeteer');
+    } catch {
+      cfg.logger.warn(`  ${C.yellow('⚠')}  puppeteer not installed`);
+      cfg.logger.warn(`  ${C.yellow('⚠')}  run "pnpm add puppeteer" to enable SSG`);
+      return { rendered: 0, failed: 0, errors: ['puppeteer not installed'] };
+    }
+
+    const errors: string[] = [];
+
+    try {
+      cfg.logger.info(`  ${C.cyan('➜')}  starting preview server...`);
+      
+      server = await createServer({
+        server: {
+          port: 0,
+          open: false,
+        },
+        build: {
+          outDir: outDir,
+          rollupOptions: {
+            input: 'index.html'
+          }
+        },
+      });
+
+      await server.listen();
+      const address = server.httpServer?.address();
+      if (typeof address === 'string') {
+        port = parseInt(address.split(':').pop() || '4173', 10);
+      } else if (address && typeof address === 'object') {
+        port = address.port;
+      } else {
+        port = 4173;
+      }
+
+      cfg.logger.info(`  ${C.green('➜')}  server running on port ${port}`);
+
+      cfg.logger.info(`  ${C.cyan('➜')}  launching browser...`);
+      const browser = await puppeteer.default.launch({
+        headless: puppeteerOptions.headless ?? true,
+        args: puppeteerOptions.args ?? [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--window-size=1920,1080',
+        ],
+        timeout: puppeteerOptions.timeout ?? 60000,
+        executablePath: puppeteerOptions.executablePath,
+      });
+
+      const page = await browser.newPage();
+      let rendered = 0;
+      let failed = 0;
+
+      const baseUrl = `http://localhost:${port}`;
+
+      for (const route of routes) {
+        try {
+          const normalizedRoute = route.startsWith('/') ? route : `/${route}`;
+          const url = `${baseUrl}${normalizedRoute}`;
+          cfg.logger.info(`  ${C.cyan('➜')}  rendering ${normalizedRoute}...`);
+
+          const response = await fetch(url);
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          await page.goto(url, {
+            waitUntil: 'networkidle0',
+            timeout: renderTimeoutMs,
+          });
+
+          await page.waitForSelector(waitForSelector, { timeout: 5000 });
+          
+          await page.evaluate(() => {
+            return new Promise((resolve) => {
+              const timeout = setTimeout(resolve, 3000);
+              document.addEventListener('bini-render-ready', () => {
+                clearTimeout(timeout);
+                resolve(null);
+              }, { once: true });
+            });
+          });
+
+          // 💡 FIX: Get the rendered HTML content inside root with proper typing
+          const rootContent = await page.evaluate((selector: string) => {
+            const el = document.querySelector(selector);
+            return el ? el.innerHTML : '';
+          }, waitForSelector);
+
+          // Use the original template and inject the rendered content
+          let html = template;
+          
+          // Replace the root div content with rendered content
+          html = html.replace(
+            /<div id="root">.*?<\/div>/s,
+            `<div id="root">${rootContent}</div>`
+          );
+
+          // Determine output path
+          let outputPath: string;
+          if (normalizedRoute === '/') {
+            outputPath = path.join(outDir, 'index.html');
+          } else {
+            const dir = path.join(outDir, normalizedRoute.replace(/^\//, ''));
+            fs.mkdirSync(dir, { recursive: true });
+            outputPath = path.join(dir, 'index.html');
+          }
+          
+          fs.writeFileSync(outputPath, html, 'utf8');
+          cfg.logger.info(`  ${C.green('➜')}  ${normalizedRoute} ${C.dim('→')} ${C.cyan(path.relative(cfg.root, outputPath))}`);
+          rendered++;
+        } catch (error) {
+          const msg = `Failed to render ${route}: ${(error as Error).message}`;
+          cfg.logger.warn(`  ${C.yellow('⚠')}  ${msg}`);
+          errors.push(msg);
+          failed++;
+        }
+      }
+
+      await browser.close();
+      cfg.logger.info(`  ${C.cyan('➜')}  browser closed`);
+
+      return { rendered, failed, errors };
+
+    } catch (error) {
+      const msg = `Prerenderer error: ${(error as Error).message}`;
+      cfg.logger.warn(`  ${C.yellow('⚠')}  ${msg}`);
+      errors.push(msg);
+      return { rendered: 0, failed: 1, errors };
+    } finally {
+      if (server) {
+        try {
+          await server.close();
+          cfg.logger.info(`  ${C.cyan('➜')}  server closed`);
+        } catch {
+          // Ignore close errors
+        }
+      }
+    }
   }
-  return [...routes].sort()
-}
 
-// ─── 404 redirect ─────────────────────────────────────────────────────────────
-//
-// GitHub Pages SPA routing with a basename works like this:
-//
-//   Direct visit to /repo/about
-//     → GitHub has no file there → serves 404.html
-//     → 404.html stores the FULL pathname (/repo/about) in sessionStorage
-//     → redirects to /repo/
-//     → index.html loads, receiver restores /repo/about via replaceState
-//     → BrowserRouter(basename="/repo/") sees /repo/about, strips prefix → /about ✓
-//
-//   WRONG approach (old bug): store only the suffix (/about), restore /about
-//     → BrowserRouter sees /about which doesn't start with /repo/
-//     → can't strip basename → falls through to * route → shows 404 page ✗
-//
-// Rule: always store and restore the FULL pathname including the basename.
+  // ─── 404 redirect ───────────────────────────────────────────────────────
 
-function generate404(base: string): string {
-  const cleanBase = normBase(base)   // e.g. '/testing-static-servers'
-  return `<!DOCTYPE html>
+  function generate404(base: string): string {
+    const cleanBase = normBase(base);
+    return `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>Redirecting\u2026</title>
 <script>
-// bini-export: GitHub Pages SPA 404 handler
-// Store the FULL original pathname (including basename prefix) so that
-// BrowserRouter can strip the prefix and match the correct route after load.
 sessionStorage.setItem('__bini_spa_redirect', location.pathname + location.search + location.hash);
 location.replace('${cleanBase}/');
 </script>
 </head>
 <body></body>
-</html>`
-}
+</html>`;
+  }
 
-// Injected as the first thing in <head> of every HTML file.
-// Runs synchronously before any JS bundle, so BrowserRouter reads the
-// already-correct URL on its very first render.
-const REDIRECT_RECEIVER = `<script>
-// bini-export: restore path after GitHub Pages 404 redirect
+  const REDIRECT_RECEIVER = `<script>
 (function () {
   var redirect = sessionStorage.getItem('__bini_spa_redirect');
   if (redirect) {
     sessionStorage.removeItem('__bini_spa_redirect');
-    // Restore FULL pathname — BrowserRouter needs the basename prefix present
     history.replaceState(null, '', redirect);
   }
 })();
-</script>`
+</script>`;
 
-// ─── Prune empty dirs ─────────────────────────────────────────────────────────
-
-function pruneEmptyDirs(root: string, rel: string, log: ResolvedConfig['logger']): void {
-  let cur = path.resolve(root, path.dirname(rel))
-  while (cur !== root && cur !== path.dirname(cur)) {
-    try {
-      if (!fs.existsSync(cur) || fs.readdirSync(cur).length > 0) break
-      fs.rmdirSync(cur)
-      log.info(`  ${C.green('➜')}  removed empty dir ${C.dim(path.relative(root, cur))}`)
-      cur = path.dirname(cur)
-    } catch { break }
-  }
-}
-
-// ─── Plugin ───────────────────────────────────────────────────────────────────
-
-export function biniExport(opts: BiniExportOptions = {}): Plugin {
-  const {
-    cleanPaths: extraPaths = [],
-    mode: targetMode = 'export',
-    copy404   = true,
-    prerender = true,
-  } = opts
-
-  const pathsToClean = [...BINI_ROUTER_GENERATED, ...extraPaths]
-
-  let cfg      : ResolvedConfig
-  let isExport = false
-
-  // Saved so we can restore App.tsx after the build completes
-  let savedOriginal : string | null = null
-  let savedAppPath  : string | null = null
-
-  function restoreApp(log: ResolvedConfig['logger']): void {
-    if (savedAppPath && savedOriginal !== null) {
-      try {
-        fs.writeFileSync(savedAppPath, savedOriginal, 'utf8')
-        log.info(`  ${C.green('➜')}  restored ${C.dim(path.relative(cfg.root, savedAppPath))}`)
-      } catch (e) {
-        log.warn(`  ${C.yellow('⚠')}  could not restore App file: ${(e as Error).message}`)
-      }
-      savedOriginal = null
-      savedAppPath  = null
-    }
-  }
-
-  function tryRemove(abs: string, rel: string): boolean {
-    try {
-      if (!fs.existsSync(abs)) return false
-      fs.rmSync(abs, { recursive: true, force: true })
-      cfg.logger.info(`  ${C.green('➜')}  removed ${C.dim(rel)}`)
-      return true
-    } catch (e) {
-      cfg.logger.warn(`  ${C.yellow('⚠')}  could not remove ${rel}: ${(e as Error).message}`)
-      return false
-    }
-  }
+  // ─── Plugin ─────────────────────────────────────────────────────────────
 
   return {
-    name   : 'vite-plugin-bini-export',
+    name: 'vite-plugin-bini-export',
     enforce: 'post',
 
-    configResolved(resolved) {
-      cfg      = resolved
-      isExport = resolved.mode === targetMode
-      if (isExport) cfg.logger.info(`\n  ${C.cyan('ß bini-export')} static export mode\n`)
-    },
-
-    // ── FIX 1: patch basename BEFORE Vite compiles any modules ────────────────
-    // bini-router's config() hook runs first and writes App.tsx with
-    // basename="/". Our buildStart (enforce:'post') runs after all other
-    // plugins' buildStart, so App.tsx is already on disk by this point.
-    buildStart() {
-      if (!isExport) return
-
-      const base    = cfg.base || '/'
-      const appFile = findAppFile(cfg.root)
-
-      if (!appFile) {
-        cfg.logger.warn(`  ${C.yellow('⚠')}  bini-export: App.tsx/App.jsx not found`)
-        return
-      }
-
-      const original = patchBasename(appFile, base)
-
-      if (original === null) {
-        // Either pattern missing (user-customised App) or already correct
+    configResolved(resolved: ResolvedConfig) {
+      cfg = resolved;
+      isExport = resolved.mode === targetMode;
+      if (isExport) {
+        cfg.logger.info(`\n  ${C.cyan('ß bini-export')} static export mode\n`);
         cfg.logger.info(
-          `  ${C.cyan('ß bini-export')} basename already correct in ` +
-          C.dim(path.relative(cfg.root, appFile))
-        )
-        return
+          ssg
+            ? `  ${C.cyan('➜')}  SSG enabled: prerendering pages via headless browser`
+            : `  ${C.cyan('➜')}  SPA mode: copying shell to routes`
+        );
       }
-
-      savedAppPath  = appFile
-      savedOriginal = original
-
-      cfg.logger.info(
-        `  ${C.cyan('ß bini-export')} patched BrowserRouter basename → ` +
-        `${C.green(base)} in ${C.dim(path.relative(cfg.root, appFile))}`
-      )
     },
 
-    // ── Inject 404 redirect receiver into every HTML file ─────────────────────
     transformIndexHtml: {
       order: 'pre',
-      handler(html) {
-        if (!isExport) return html
-        // First child of <head> → runs before any deferred script,
-        // before React, before BrowserRouter reads window.location
-        return html.replace(/<head([^>]*)>/i, m => m + '\n    ' + REDIRECT_RECEIVER)
+      handler(html: string) {
+        if (!isExport) return html;
+        // Store the original template for later use
+        originalTemplate = html;
+        
+        let result = html.replace(/<head([^>]*)>/i, (match: string) => {
+          if (match.includes('__bini_spa_redirect')) return match;
+          return match + '\n    ' + REDIRECT_RECEIVER;
+        });
+        return result;
       },
     },
 
-    // ── Post-build: copy routes, write 404.html, clean up ─────────────────────
     async closeBundle() {
-      if (!isExport || cfg.command !== 'build') {
-        restoreApp(cfg.logger)
-        return
-      }
+      if (!isExport || cfg.command !== 'build') return;
 
-      const base   = cfg.base || '/'
-      const outDir = path.resolve(cfg.root, cfg.build.outDir)
+      const base = cfg.base || '/';
+      const outDir = path.resolve(cfg.root, cfg.build.outDir);
 
-      // Restore App.tsx first — dist/ is fully written by now
-      restoreApp(cfg.logger)
-
-      const indexPath = path.join(outDir, 'index.html')
+      const indexPath = path.join(outDir, 'index.html');
       if (!fs.existsSync(indexPath)) {
-        cfg.logger.warn(`  ${C.yellow('⚠')}  dist/index.html not found — build may have failed`)
-        return
+        cfg.logger.warn(`  ${C.yellow('⚠')}  dist/index.html not found — build may have failed`);
+        return;
       }
 
-      const indexHtml = fs.readFileSync(indexPath, 'utf8')
+      // Read the final template (with redirect receiver injected)
+      const template = fs.readFileSync(indexPath, 'utf8');
 
-      // ── Copy index.html into each route folder ─────────────────────────────
-      if (prerender) {
-        const routes = scanRoutes(cfg.root)
-        cfg.logger.info(
-          `\n  ${C.cyan('ß bini-export')} copying index.html to ${C.green(String(routes.length))} route(s)`
-        )
+      cfg.logger.info(`\n  ${C.cyan('ß bini-export')} collecting routes...`);
+      const routes = await collectAllRoutes(cfg.root);
+      cfg.logger.info(`  ${C.green('➜')}  found ${C.green(String(routes.length))} route(s)`);
 
-        for (const route of routes) {
-          if (route === '/') continue                 // root already exists
+      let rendered = 0;
+      let failed = 0;
+      let usedSSG = false;
 
-          const dir  = path.join(outDir, route.replace(/^\//, ''))
-          const file = path.join(dir, 'index.html')
-
-          try {
-            fs.mkdirSync(dir, { recursive: true })
-            fs.writeFileSync(file, indexHtml, 'utf8')
-            cfg.logger.info(
-              `  ${C.green('➜')}  ${route} ${C.dim('→')} ${C.cyan(path.relative(cfg.root, file))}`
-            )
-          } catch (e) {
-            cfg.logger.warn(`  ${C.yellow('⚠')}  failed to copy to ${route}: ${(e as Error).message}`)
+      if (ssg) {
+        const result = await prerenderWithPuppeteer(routes, outDir, template);
+        rendered = result.rendered;
+        failed = result.failed;
+        usedSSG = rendered > 0;
+        
+        if (result.errors.length > 0) {
+          cfg.logger.warn(`\n  ${C.yellow('⚠')}  ${result.errors.length} error(s) during prerendering:`);
+          for (const err of result.errors) {
+            cfg.logger.warn(`     ${C.dim(err)}`);
           }
         }
       }
 
-      // ── Write 404.html ─────────────────────────────────────────────────────
+      // Shell fallback for any routes that weren't prerendered
+      for (const route of routes) {
+        const normalizedRoute = route.startsWith('/') ? route : `/${route}`;
+        const dir = normalizedRoute === '/' ? outDir : path.join(outDir, normalizedRoute.replace(/^\//, ''));
+        const file = path.join(dir, 'index.html');
+        if (fs.existsSync(file)) continue;
+        if (normalizedRoute === '/') continue;
+
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(file, template, 'utf8');
+        cfg.logger.info(
+          `  ${C.dim('➜')}  ${normalizedRoute} ${C.dim('→')} shell fallback (not rendered)`
+        );
+      }
+
+      // ── WRITE 404.HTML ─────────────────────────────────────────────────
+
       if (copy404) {
-        const dest      = path.join(outDir, '404.html')
-        const hasCustom = findNotFoundFile(cfg.root)
+        const dest = path.join(outDir, '404.html');
+        const hasCustom =
+          fs.existsSync(path.join(cfg.root, 'src/app/not-found.jsx')) ||
+          fs.existsSync(path.join(cfg.root, 'src/app/not-found.tsx'));
 
         try {
           if (hasCustom) {
-            // Custom not-found page: serve the SPA shell so React Router can
-            // render the user's not-found component via the * route client-side
-            fs.writeFileSync(dest, indexHtml, 'utf8')
-            cfg.logger.info(
-              `  ${C.green('➜')}  404.html ${C.dim('←')} custom not-found ` +
-              C.cyan(path.relative(cfg.root, dest))
-            )
+            fs.writeFileSync(dest, template, 'utf8');
+            cfg.logger.info(`  ${C.green('➜')}  404.html ${C.dim('←')} custom not-found page`);
           } else {
-            // Default: JS redirect that stores the full URL and bounces to root
-            fs.writeFileSync(dest, generate404(base), 'utf8')
-            cfg.logger.info(
-              `  ${C.green('➜')}  404.html ${C.dim('←')} redirect template ` +
-              C.cyan(path.relative(cfg.root, dest))
-            )
+            fs.writeFileSync(dest, generate404(base), 'utf8');
+            cfg.logger.info(`  ${C.green('➜')}  404.html ${C.dim('←')} redirect handler`);
           }
-        } catch (e) {
-          cfg.logger.warn(`  ${C.yellow('⚠')}  failed to write 404.html: ${(e as Error).message}`)
+        } catch (error) {
+          cfg.logger.warn(`  ${C.yellow('⚠')}  failed to write 404.html: ${(error as Error).message}`);
         }
       }
 
-      // ── Remove bini-router platform entry files ────────────────────────────
-      let removed = 0
-      for (const rel of pathsToClean) {
-        const abs = path.resolve(cfg.root, rel)
-        if (tryRemove(abs, rel)) {
-          pruneEmptyDirs(cfg.root, rel, cfg.logger)
-          removed++
-        }
-      }
+      // ── SUMMARY ─────────────────────────────────────────────────────────
 
+      const status = usedSSG ? C.cyan('SSG') : C.dim('SPA fallback');
       cfg.logger.info(
-        removed === 0
-          ? `\n  ${C.cyan('ß bini-export')} dist/ is already clean\n`
-          : `\n  ${C.cyan('ß bini-export')} export complete — ${C.green(String(removed))} file(s) removed\n`
-      )
+        `\n  ${C.cyan('ß bini-export')} export complete ${C.green('✓')}\n` +
+          `  ${C.green('➜')}  ${rendered} route(s) prerendered` +
+          (failed > 0 ? `, ${C.yellow(String(failed))} failed` : '') +
+          `\n  ${C.green('➜')}  mode: ${status}` +
+          `\n  ${C.green('➜')}  output: ${C.cyan(path.relative(cfg.root, outDir))}/\n`
+      );
     },
-
-    // Safety net — always restore App.tsx even if the build throws
-    buildEnd(error) {
-      if (error) restoreApp(cfg.logger)
-    },
-  }
+  };
 }
