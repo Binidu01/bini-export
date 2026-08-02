@@ -9,8 +9,8 @@
 [![typescript](https://img.shields.io/badge/typescript-ready-3178c6?labelColor=0a0a0a&style=flat-square)](https://www.typescriptlang.org)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-00CFFF?labelColor=0a0a0a&style=flat-square)](https://github.com/Binidu01/bini-export/pulls)
 
-**Static Site Generator for Bini.js projects with true SSG.**  
-Pre-renders every static route to full HTML for SEO, generates `404.html`, and strips platform server files — leaving `dist/` ready for GitHub Pages, S3, Firebase, Surge, and any other static host.
+**Static Site Generator for Bini.js projects, with optional true SSG via headless-browser pre-rendering.**
+Discovers routes from `src/app/`, pre-renders them to static HTML with a pool of parallel headless Chrome tabs, generates `404.html`, and leaves `dist/` ready for GitHub Pages, S3, Firebase, Surge, and any other static host.
 
 </div>
 
@@ -21,8 +21,6 @@ Pre-renders every static route to full HTML for SEO, generates `404.html`, and s
 ```bash
 npm install -D bini-export
 ```
-
-> **Note:** `puppeteer` is a dependency of `bini-export` and will be installed automatically. It is required for headless browser pre-rendering.
 
 ---
 
@@ -39,8 +37,8 @@ import { biniExport } from 'bini-export';
 export default defineConfig({
   plugins: [
     react(),
-    biniroute({ platform: 'node' }),
-    biniExport(), // SSG enabled by default
+    biniroute(),
+    biniExport(), // SSG enabled by default (puppeteer installs automatically)
   ],
 });
 ```
@@ -61,7 +59,7 @@ export default defineConfig({
 npm run export
 ```
 
-Your fully static site is now in `dist/`!
+Your static site is now in `dist/`.
 
 ---
 
@@ -69,41 +67,32 @@ Your fully static site is now in `dist/`!
 
 | Feature | Description |
 |---------|-------------|
-| **True SSG** | Pre-renders every route to fully static HTML — not just an SPA shell |
-| **SEO Ready** | All content is rendered in HTML for search engines and AI crawlers |
-| **File-based Routing** | Automatically discovers routes from `src/app/` |
-| **Dynamic Routes** | Supports `getStaticPaths` for pre-rendering dynamic routes |
-| **Route Groups** | Ignores `(folder)` in paths |
-| **Private Folders** | Skips `_folder` in routing |
-| **MDX Support** | Pre-renders MDX and Markdown pages |
-| **Clean Output** | Removes platform-specific server files automatically |
-| **404 Handling** | Generates `404.html` with redirect for GitHub Pages |
-| **Works Anywhere** | GitHub Pages, Netlify, Vercel, S3, Firebase, Surge |
+| **True SSG** | Pre-renders every discovered route to fully static HTML via a headless-Chrome pool, not just an SPA shell |
+| **Parallel rendering** | Routes render concurrently across multiple tabs sharing one browser instance (tunable via `concurrency`) |
+| **SEO Ready** | Rendered content is present in the HTML for search engines and AI crawlers |
+| **File-based Routing** | Automatically discovers routes from `src/app/` (`page.tsx` / `page.jsx`) |
+| **Route Groups** | Ignores `(folder)` segments in the URL path |
+| **Private Folders** | Skips any `_folder` (and files starting with `_`) during route collection |
+| **MDX/Markdown pages** | Treats `.mdx`/`.md` files under `src/app/` as routes (rendering itself is handled by your MDX loader, not this plugin) |
+| **Runtime CSS capture** | Captures `<style>`/`<link rel="stylesheet">` tags injected into `<head>` at runtime (e.g. CSS-in-JS) so pages are styled on first paint, not just after hydration |
+| **Asset path normalization** | Rewrites relative `href`/`src` paths to absolute so nested route pages (e.g. `/about/index.html`) don't lose CSS/JS |
+| **404 Handling** | Generates `404.html` — either a copy of your custom not-found page, or a redirect-and-restore script for SPA routing on static hosts |
+| **Graceful fallback** | Since `puppeteer` ships as a dependency, this mainly guards against edge cases (corrupted install, unsupported platform, a route erroring out mid-render) — any route that fails to pre-render falls back to your built SPA shell instead of failing the whole build |
+
+**Not currently supported** (despite sometimes being assumed for SSG tools like this): dynamic routes with bracket segments (`[slug]`) are **skipped automatically** during route collection — there's no `getStaticPaths` mechanism. If you need a dynamic route pre-rendered, pass its concrete paths explicitly via the `routes` option.
 
 ---
 
 ## 📁 How It Works
 
-1. **Build** — Vite builds your app
-2. **Collect Routes** — Discovers all static routes from `src/app/`
-3. **Launch Browser** — Starts a preview server and launches Puppeteer
-4. **Pre-render** — Navigates to each route and captures the fully rendered HTML
-5. **Save** — Writes the HTML to the correct output path
-6. **Cleanup** — Removes platform-specific server files
-
-### Dynamic Routes Example
-
-```tsx
-// src/app/blog/[slug]/page.tsx
-export default function BlogPost({ params }) {
-  return <h1>Blog: {params.slug}</h1>;
-}
-
-export async function getStaticPaths() {
-  const posts = await fetch('https://api.example.com/posts').then(r => r.json());
-  return posts.map(post => ({ params: { slug: post.slug } }));
-}
-```
+1. **Build** — Vite builds your app normally for the `export` mode
+2. **Collect Routes** — Discovers static routes from `src/app/` (or uses `routes` if you passed it explicitly)
+3. **Normalize the template** — Reads the built `dist/index.html` and rewrites relative asset paths to absolute
+4. **Launch Browser** — Starts a local Vite preview server and one headless Chrome instance
+5. **Pre-render in parallel** — A pool of tabs (default up to `min(8, cpus × 2)`) pulls routes from a shared queue; each tab navigates, waits for your content and any runtime-injected styles, then extracts the rendered HTML
+6. **Save** — Writes each route's HTML to its matching output path (`/about` → `dist/about/index.html`)
+7. **Shell fallback** — Any route that wasn't successfully pre-rendered (puppeteer missing, or that route errored) gets the plain built shell instead
+8. **404.html** — Written last, either from your custom not-found page or as a redirect-and-restore script
 
 ---
 
@@ -113,23 +102,40 @@ export async function getStaticPaths() {
 biniExport({
   // Vite mode that activates this plugin
   mode?: string; // @default 'export'
-  
+
   // Write dist/404.html
   copy404?: boolean; // @default true
-  
-  // Enable true SSG via headless-browser prerendering
+
+  // Enable true SSG via headless-browser prerendering.
+  // If false (or puppeteer is missing), routes get the plain SPA shell.
   ssg?: boolean; // @default true
-  
-  // Routes to pre-render (auto-detected if not specified)
+
+  // Routes to pre-render. Auto-detected from src/app/ if not specified.
+  // Required if you need dynamic ([slug]) routes rendered, since those
+  // are skipped by auto-detection.
   routes?: string[];
-  
-  // Selector that must exist before capturing HTML
+
+  // Selector that must exist in the DOM before a route is considered rendered
   waitForSelector?: string; // @default '#root'
-  
-  // Max time per route in ms
+
+  // Max time (ms) to wait for a single route to finish rendering
   renderTimeoutMs?: number; // @default 15000
-  
-  // Custom Puppeteer launch options
+
+  // Number of routes rendered in parallel (separate tabs, one shared browser)
+  concurrency?: number; // @default min(8, cpus() * 2)
+
+  // How long to wait for a 'bini-render-ready' custom event before giving up
+  // and using whatever's currently in the DOM
+  readyEventTimeoutMs?: number; // @default 300
+
+  // Puppeteer's page.goto waitUntil condition.
+  // 'load'/'domcontentloaded' are fast; 'networkidle0'/'networkidle2' wait
+  // longer but are safer if your content depends on requests firing after load.
+  navigationWaitUntil?: 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2'; // @default 'load'
+
+  // Custom Puppeteer launch options (merged over internal defaults tuned
+  // for headless batch rendering — background throttling, extensions, etc.
+  // are disabled by default)
   puppeteerOptions?: {
     headless?: boolean;
     args?: string[];
@@ -139,37 +145,36 @@ biniExport({
 })
 ```
 
+### A note on `navigationWaitUntil` and dynamic content
+
+If your page fetches data *after* the `load` event fires (e.g. inside a `useEffect`), the default `'load'` may snapshot before that data resolves. Either:
+- make sure your app dispatches a `bini-render-ready` `CustomEvent` on `document` once it's actually done rendering, or
+- set `navigationWaitUntil: 'networkidle0'` for slower-but-safer behavior.
+
+### A note on blocked resources during rendering
+
+To speed up pre-rendering, image/font/media requests are blocked at the network layer (via CDP `Network.setBlockedURLs`) while Chrome renders each route. This only affects what Puppeteer fetches during the render step — it has no effect on your shipped `dist/` output or what real visitors' browsers load. If your app does font-based layout measurement (e.g. canvas text-fitting) during initial render, be aware fallback fonts will be in effect at snapshot time.
+
 ---
 
 ## 🗂️ Output Structure
 
+Actual structure depends on your Vite build config, but a typical output looks like:
+
 ```
 dist/
-├── index.html          ✅ Fully rendered home page
-├── 404.html            ✅ Redirect handler
+├── index.html          ✅ Pre-rendered home page
+├── 404.html            ✅ Custom not-found copy, or redirect handler
 ├── about/
-│   └── index.html      ✅ Fully rendered about page
+│   └── index.html      ✅ Pre-rendered about page
 ├── docs/
-│   ├── index.html      ✅ Fully rendered docs landing
+│   ├── index.html      ✅ Pre-rendered docs landing
 │   └── api-cors/
-│       └── index.html  ✅ Fully rendered nested page
-├── js/                 ✅ Hydration scripts (preserved)
-├── css/                ✅ Styles
-└── assets/             ✅ Images, fonts, etc.
+│       └── index.html  ✅ Pre-rendered nested page
+└── assets/              ✅ Hashed JS/CSS/image bundles (Vite's default output)
 ```
 
----
-
-## 🧹 Files Cleaned After Export
-
-| Platform | Files Removed |
-|----------|---------------|
-| Netlify | `netlify/edge-functions/api.ts`, `api.js` |
-| Cloudflare Workers | `worker.ts`, `worker.js` |
-| Node / Deno / Bun | `server/index.ts`, `server/index.js` |
-| Vercel | `api/index.ts`, `api/index.js` |
-
-Empty parent directories are pruned automatically.
+Any route that failed to pre-render (or if `puppeteer`/`ssg` isn't enabled) still gets an `index.html` at the correct path — it's just your built SPA shell rather than pre-rendered content.
 
 ---
 
@@ -177,18 +182,20 @@ Empty parent directories are pruned automatically.
 
 | Situation | What gets written to `404.html` |
 |-----------|----------------------------------|
-| `src/app/not-found.tsx` exists | Copy of `index.html` — React Router renders your custom not-found |
-| No custom not-found file | Redirect script that saves the original URL and sends to root |
+| `src/app/not-found.tsx` or `not-found.jsx` exists | A copy of the built `index.html` template — your client-side router renders the custom not-found UI |
+| No custom not-found file | A small redirect script: saves the requested path to `sessionStorage`, redirects to the site root, and a receiver script on every page restores the URL via `history.replaceState` |
 
 ---
 
 ## 🌐 Works on Any Static Host
 
-| Host | Static Routes | Dynamic Routes |
-|------|---------------|----------------|
+Pre-rendered static routes work anywhere. For paths not known at build time (e.g. you rely on client-side routing for something not in your route list), point your host's error/fallback page at `404.html`:
+
+| Host | Static Routes | Client-side Fallback Routes |
+|------|---------------|------------------------------|
 | GitHub Pages | ✅ | ✅ via `404.html` |
-| AWS S3 + CloudFront | ✅ | ✅ set error page to `404.html` |
-| Firebase Hosting | ✅ | ✅ via `404.html` |
+| AWS S3 + CloudFront | ✅ | ✅ set the error document to `404.html` |
+| Firebase Hosting | ✅ | ✅ via `404.html` rewrite |
 | Surge.sh | ✅ | ✅ via `404.html` |
 | Netlify (static) | ✅ | ✅ via `404.html` |
 | Vercel (static) | ✅ | ✅ via `404.html` |

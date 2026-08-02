@@ -1,6 +1,7 @@
 // bini-export/src/index.ts
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import type { Plugin, ResolvedConfig } from 'vite';
 import { createServer } from 'vite';
 
@@ -20,6 +21,28 @@ export interface BiniExportOptions {
   waitForSelector?: string;
   /** Max time (ms) to wait for a route to finish rendering. @default 15000 */
   renderTimeoutMs?: number;
+  /**
+   * Number of routes to render in parallel (separate tabs, one shared
+   * browser). Rendering is mostly I/O/wait-bound, not CPU-bound, so this
+   * can safely exceed your core count. @default min(8, cpus * 2)
+   */
+  concurrency?: number;
+  /**
+   * How long to wait for the 'bini-render-ready' event before giving up
+   * and using whatever's in the DOM. If your app doesn't dispatch that
+   * event, this fires on every single route — keep it small.
+   * @default 300
+   */
+  readyEventTimeoutMs?: number;
+  /**
+   * Puppeteer's page.goto waitUntil condition. 'networkidle0' is safest
+   * but can be very slow (waits for 500ms of zero in-flight requests,
+   * reset by any analytics/websocket/polling call). 'load' or
+   * 'domcontentloaded' are much faster and usually fine since we also
+   * explicitly wait for waitForSelector + the ready event.
+   * @default 'load'
+   */
+  navigationWaitUntil?: 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2';
   /** Custom Puppeteer launch options */
   puppeteerOptions?: {
     headless?: boolean;
@@ -37,6 +60,9 @@ export function biniExport(opts: BiniExportOptions = {}): Plugin {
     routes: userRoutes,
     waitForSelector = '#root',
     renderTimeoutMs = 15000,
+    concurrency = Math.max(2, Math.min(8, os.cpus().length * 2)),
+    readyEventTimeoutMs = 300,
+    navigationWaitUntil = 'load',
     puppeteerOptions = {},
   } = opts;
 
@@ -59,6 +85,24 @@ export function biniExport(opts: BiniExportOptions = {}): Plugin {
     return b === '/' ? '' : b.replace(/\/$/, '');
   }
 
+  /**
+   * Rewrite relative href/src asset paths (e.g. "./assets/x.css",
+   * "assets/x.js") to absolute ones anchored at `base`. Without this, a
+   * route written to dist/about/index.html resolves relative asset paths
+   * against /about/ instead of /, silently 404ing the CSS/JS bundle.
+   */
+  function absolutizeAssetPaths(html: string, base: string): string {
+    const cleanBase = normBase(base); // '' or '/some-base'
+    return html.replace(
+      /(href|src)=(["'])(?!https?:\/\/|\/\/|data:|mailto:|#)([^"']+)\2/gi,
+      (match, attr, quote, url) => {
+        if (url.startsWith('/')) return match; // already absolute
+        const stripped = url.replace(/^\.\//, '');
+        return `${attr}=${quote}${cleanBase}/${stripped}${quote}`;
+      }
+    );
+  }
+
   // ─── Route Collector for src/app/ ──────────────────────────────────────
 
   async function collectAllRoutes(root: string): Promise<string[]> {
@@ -72,7 +116,7 @@ export function biniExport(opts: BiniExportOptions = {}): Plugin {
     }
 
     await collectRoutesFromDir(appDir, '', routes);
-    
+
     const filtered = [...routes].filter(r => {
       const parts = r.split('/').filter(Boolean);
       if (parts.length === 0) return true;
@@ -82,7 +126,7 @@ export function biniExport(opts: BiniExportOptions = {}): Plugin {
              !r.includes(':') &&
              !r.includes('*');
     });
-    
+
     return filtered.map(r => r.startsWith('/') ? r : `/${r}`);
   }
 
@@ -120,7 +164,7 @@ export function biniExport(opts: BiniExportOptions = {}): Plugin {
         }
       } else if (entry.name.endsWith('.tsx') || entry.name.endsWith('.jsx')) {
         const name = entry.name.replace(/\.(tsx|jsx)$/, '');
-        if (name !== 'page' && name !== 'layout' && name !== 'loading' && 
+        if (name !== 'page' && name !== 'layout' && name !== 'loading' &&
             name !== 'error' && name !== 'not-found') {
           const routePath = basePath ? `${basePath}/${name}` : `/${name}`;
           routes.add(routePath);
@@ -129,7 +173,7 @@ export function biniExport(opts: BiniExportOptions = {}): Plugin {
     }
   }
 
-  // ─── Direct Puppeteer Prerenderer ──────────────────────────────────────
+  // ─── Parallel Puppeteer Prerenderer ────────────────────────────────────
 
   async function prerenderWithPuppeteer(
     routes: string[],
@@ -152,7 +196,7 @@ export function biniExport(opts: BiniExportOptions = {}): Plugin {
 
     try {
       cfg.logger.info(`  ${C.cyan('➜')}  starting preview server...`);
-      
+
       server = await createServer({
         server: {
           port: 0,
@@ -177,8 +221,8 @@ export function biniExport(opts: BiniExportOptions = {}): Plugin {
       }
 
       cfg.logger.info(`  ${C.green('➜')}  server running on port ${port}`);
+      cfg.logger.info(`  ${C.cyan('➜')}  launching browser (concurrency: ${concurrency})...`);
 
-      cfg.logger.info(`  ${C.cyan('➜')}  launching browser...`);
       const browser = await puppeteer.default.launch({
         headless: puppeteerOptions.headless ?? true,
         args: puppeteerOptions.args ?? [
@@ -187,80 +231,143 @@ export function biniExport(opts: BiniExportOptions = {}): Plugin {
           '--disable-dev-shm-usage',
           '--disable-gpu',
           '--window-size=1920,1080',
+          // These don't affect render correctness, only save time we don't need to spend:
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
+          '--disable-ipc-flooding-protection',
+          '--disable-extensions',
+          '--disable-component-extensions-with-background-pages',
+          '--disable-default-apps',
+          '--disable-background-networking',
+          '--disable-sync',
+          '--metrics-recording-only',
+          '--mute-audio',
+          '--no-default-browser-check',
+          '--no-first-run',
         ],
         timeout: puppeteerOptions.timeout ?? 60000,
         executablePath: puppeteerOptions.executablePath,
       });
 
-      const page = await browser.newPage();
       let rendered = 0;
       let failed = 0;
-
       const baseUrl = `http://localhost:${port}`;
 
-      for (const route of routes) {
-        try {
-          const normalizedRoute = route.startsWith('/') ? route : `/${route}`;
-          const url = `${baseUrl}${normalizedRoute}`;
-          cfg.logger.info(`  ${C.cyan('➜')}  rendering ${normalizedRoute}...`);
+      // Shared work queue — each worker (tab) pulls the next route until
+      // the queue is empty. This is what actually parallelizes rendering.
+      const queue = [...routes];
 
-          const response = await fetch(url);
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
+      async function renderOne(page: any, route: string): Promise<void> {
+        const normalizedRoute = route.startsWith('/') ? route : `/${route}`;
+        const url = `${baseUrl}${normalizedRoute}`;
+        cfg.logger.info(`  ${C.cyan('➜')}  rendering ${normalizedRoute}...`);
 
-          await page.goto(url, {
-            waitUntil: 'networkidle0',
-            timeout: renderTimeoutMs,
-          });
+        const response = await page.goto(url, {
+          waitUntil: navigationWaitUntil,
+          timeout: renderTimeoutMs,
+        });
 
-          await page.waitForSelector(waitForSelector, { timeout: 5000 });
-          
-          await page.evaluate(() => {
-            return new Promise((resolve) => {
-              const timeout = setTimeout(resolve, 3000);
-              document.addEventListener('bini-render-ready', () => {
-                clearTimeout(timeout);
-                resolve(null);
-              }, { once: true });
-            });
-          });
-
-          // 💡 FIX: Get the rendered HTML content inside root with proper typing
-          const rootContent = await page.evaluate((selector: string) => {
-            const el = document.querySelector(selector);
-            return el ? el.innerHTML : '';
-          }, waitForSelector);
-
-          // Use the original template and inject the rendered content
-          let html = template;
-          
-          // Replace the root div content with rendered content
-          html = html.replace(
-            /<div id="root">.*?<\/div>/s,
-            `<div id="root">${rootContent}</div>`
-          );
-
-          // Determine output path
-          let outputPath: string;
-          if (normalizedRoute === '/') {
-            outputPath = path.join(outDir, 'index.html');
-          } else {
-            const dir = path.join(outDir, normalizedRoute.replace(/^\//, ''));
-            fs.mkdirSync(dir, { recursive: true });
-            outputPath = path.join(dir, 'index.html');
-          }
-          
-          fs.writeFileSync(outputPath, html, 'utf8');
-          cfg.logger.info(`  ${C.green('➜')}  ${normalizedRoute} ${C.dim('→')} ${C.cyan(path.relative(cfg.root, outputPath))}`);
-          rendered++;
-        } catch (error) {
-          const msg = `Failed to render ${route}: ${(error as Error).message}`;
-          cfg.logger.warn(`  ${C.yellow('⚠')}  ${msg}`);
-          errors.push(msg);
-          failed++;
+        if (!response || !response.ok()) {
+          throw new Error(`HTTP ${response ? response.status() : 'no response'}`);
         }
+
+        await page.waitForSelector(waitForSelector, { timeout: 5000 });
+
+        await page.evaluate((readyTimeout: number) => {
+          return new Promise((resolve) => {
+            const timeout = setTimeout(resolve, readyTimeout);
+            document.addEventListener('bini-render-ready', () => {
+              clearTimeout(timeout);
+              resolve(null);
+            }, { once: true });
+          });
+        }, readyEventTimeoutMs);
+
+        const rootContent = await page.evaluate((selector: string) => {
+          const el = document.querySelector(selector);
+          return el ? el.innerHTML : '';
+        }, waitForSelector);
+
+        // Capture any <style>/<link rel="stylesheet"> tags that ended up in
+        // <head> at runtime (e.g. CSS-in-JS libs like styled-components,
+        // emotion, vanilla-extract, or dynamically-injected route chunks).
+        // If we only grab #root's innerHTML, these never make it into the
+        // written file — the page paints unstyled until JS hydrates and
+        // re-injects them client-side. So we pull them out here and bake
+        // them into the static head instead.
+        const extraHeadTags: string[] = await page.evaluate((existingHtml: string) => {
+          const tags = Array.from(
+            document.head.querySelectorAll('style, link[rel="stylesheet"]')
+          ) as (HTMLStyleElement | HTMLLinkElement)[];
+          return tags
+            .map((el) => el.outerHTML)
+            .filter((outerHtml) => !existingHtml.includes(outerHtml));
+        }, template);
+
+        let html = template;
+        html = html.replace(
+          /<div id="root">.*?<\/div>/s,
+          `<div id="root">${rootContent}</div>`
+        );
+
+        if (extraHeadTags.length > 0) {
+          html = html.replace('</head>', `${extraHeadTags.join('\n    ')}\n  </head>`);
+        }
+
+        let outputPath: string;
+        if (normalizedRoute === '/') {
+          outputPath = path.join(outDir, 'index.html');
+        } else {
+          const dir = path.join(outDir, normalizedRoute.replace(/^\//, ''));
+          fs.mkdirSync(dir, { recursive: true });
+          outputPath = path.join(dir, 'index.html');
+        }
+
+        fs.writeFileSync(outputPath, html, 'utf8');
+        cfg.logger.info(`  ${C.green('➜')}  ${normalizedRoute} ${C.dim('→')} ${C.cyan(path.relative(cfg.root, outputPath))}`);
       }
+
+      async function worker(): Promise<void> {
+        const page = await browser.newPage();
+        // Block heavy, unnecessary resources at the network layer via CDP.
+        // Cheaper than page.setRequestInterception, which round-trips
+        // every single request through the CDP protocol to decide whether
+        // to abort it. setBlockedURLs does the filtering on the browser
+        // side instead.
+        try {
+          const client = await page.target().createCDPSession();
+          await client.send('Network.setBlockedURLs', {
+            urls: [
+              '*.png', '*.jpg', '*.jpeg', '*.gif', '*.webp', '*.avif', '*.svg',
+              '*.mp4', '*.webm', '*.mp3', '*.wav',
+              '*.woff', '*.woff2', '*.ttf', '*.otf', '*.eot',
+            ],
+          });
+          await client.send('Network.enable');
+        } catch {
+          // If this fails on an older Chrome build, just proceed without it.
+        }
+
+        while (queue.length > 0) {
+          const route = queue.shift();
+          if (!route) break;
+          try {
+            await renderOne(page, route);
+            rendered++;
+          } catch (error) {
+            const msg = `Failed to render ${route}: ${(error as Error).message}`;
+            cfg.logger.warn(`  ${C.yellow('⚠')}  ${msg}`);
+            errors.push(msg);
+            failed++;
+          }
+        }
+
+        await page.close();
+      }
+
+      const workerCount = Math.min(concurrency, routes.length) || 1;
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
       await browser.close();
       cfg.logger.info(`  ${C.cyan('➜')}  browser closed`);
@@ -335,9 +442,8 @@ location.replace('${cleanBase}/');
       order: 'pre',
       handler(html: string) {
         if (!isExport) return html;
-        // Store the original template for later use
         originalTemplate = html;
-        
+
         let result = html.replace(/<head([^>]*)>/i, (match: string) => {
           if (match.includes('__bini_spa_redirect')) return match;
           return match + '\n    ' + REDIRECT_RECEIVER;
@@ -358,8 +464,10 @@ location.replace('${cleanBase}/');
         return;
       }
 
-      // Read the final template (with redirect receiver injected)
-      const template = fs.readFileSync(indexPath, 'utf8');
+      // Read the final template (with redirect receiver injected), then
+      // absolutize asset paths so nested route folders don't lose CSS/JS.
+      let template = fs.readFileSync(indexPath, 'utf8');
+      template = absolutizeAssetPaths(template, base);
 
       cfg.logger.info(`\n  ${C.cyan('ß bini-export')} collecting routes...`);
       const routes = await collectAllRoutes(cfg.root);
@@ -370,11 +478,14 @@ location.replace('${cleanBase}/');
       let usedSSG = false;
 
       if (ssg) {
+        const t0 = Date.now();
         const result = await prerenderWithPuppeteer(routes, outDir, template);
         rendered = result.rendered;
         failed = result.failed;
         usedSSG = rendered > 0;
-        
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+        cfg.logger.info(`  ${C.cyan('➜')}  prerendering took ${elapsed}s`);
+
         if (result.errors.length > 0) {
           cfg.logger.warn(`\n  ${C.yellow('⚠')}  ${result.errors.length} error(s) during prerendering:`);
           for (const err of result.errors) {

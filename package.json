@@ -1,6 +1,6 @@
 {
   "name": "bini-export",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Static export for Bini.js with true SSG — pre-renders routes to static HTML with full page content via headless browser",
   "type": "module",
   "license": "MIT",
